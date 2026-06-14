@@ -1,0 +1,19 @@
+# Rust 编译产物（几百MB，绝对不能传）
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# 本地数据库文件（你的个人数据，不需要上传到开源仓库）
+campus_db.json
+campus_db.aof
+*.csv
+
+# 编辑器/IDE 配置
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统临时文件
+.DS_Store
+Thumbs.db
