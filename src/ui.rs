@@ -398,15 +398,23 @@ impl KvApp {
                     }
                 }
                 
-                // 验证并导入所有学生
+                // ✅ 验证并批量导入（修复 O(n²)→O(1) + 批量AOF）
                 let mut count = 0;
+                let mut aof_batch: Vec<Command> = Vec::with_capacity(student_map.len());
+                self.db.students.reserve(student_map.len()); // 预分配，避免多次扩容
                 for student in student_map.into_values() {
-                    if validate_student(&student).is_ok() && !self.db.students.iter().any(|s| s.id == student.id) {
+                    if validate_student(&student).is_ok()
+                        && !self.db.student_index.contains_key(&student.id)
+                    {
+                        self.db
+                            .student_index
+                            .insert(student.id.clone(), self.db.students.len());
                         self.db.students.push(student.clone());
-                        let _ = self.db.append_aof(Command::AddStudent(student));
+                        aof_batch.push(Command::AddStudent(student));
                         count += 1;
                     }
                 }
+                let _ = self.db.append_aof_batch(&aof_batch); // 仅一次批量刷盘
                 
                 let _ = self.db.save(&self.db_path);
                 self.db.rebuild_indexes();
@@ -414,14 +422,16 @@ impl KvApp {
                 self.student_filter_query.clear();
                 Ok((count, 0, 0))
             } else if has_teacher_headers {
-                // 教师CSV导入（不变）
+                // ✅ 教师CSV导入（批量优化：O(1)查重 + 预分配 + 批量AOF）
                 let mut count = 0;
+                let mut aof_batch: Vec<Command> = Vec::with_capacity(1024);
+                self.db.teachers.reserve(1024);
                 for result in rdr.records() {
                     let record = result.map_err(|e| e.to_string())?;
                     if record.len() < 7 {
                         continue;
                     }
-                    
+
                     let teacher = Teacher {
                         id: record.get(0).unwrap_or("").to_string(),
                         name: record.get(1).unwrap_or("").to_string(),
@@ -431,27 +441,35 @@ impl KvApp {
                         title: record.get(5).unwrap_or("").to_string(),
                         research: record.get(6).unwrap_or("").to_string(),
                     };
-                    
-                    if validate_teacher(&teacher).is_ok() && !self.db.teachers.iter().any(|t| t.id == teacher.id) {
+
+                    if validate_teacher(&teacher).is_ok()
+                        && !self.db.teacher_index.contains_key(&teacher.id)
+                    {
+                        self.db
+                            .teacher_index
+                            .insert(teacher.id.clone(), self.db.teachers.len());
                         self.db.teachers.push(teacher.clone());
-                        let _ = self.db.append_aof(Command::AddTeacher(teacher));
+                        aof_batch.push(Command::AddTeacher(teacher));
                         count += 1;
                     }
                 }
+                let _ = self.db.append_aof_batch(&aof_batch);
                 
                 let _ = self.db.save(&self.db_path);
                 self.db.rebuild_indexes();
                 self.teacher_filtered_indices.clear();
                 Ok((0, count, 0))
             } else if has_book_headers {
-                // 书籍CSV导入（不变）
+                // ✅ 书籍CSV导入（批量优化：O(1)查重 + 预分配 + 批量AOF）
                 let mut count = 0;
+                let mut aof_batch: Vec<Command> = Vec::with_capacity(1024);
+                self.db.books.reserve(1024);
                 for result in rdr.records() {
                     let record = result.map_err(|e| e.to_string())?;
                     if record.len() < 7 {
                         continue;
                     }
-                    
+
                     let book = Book {
                         isbn: record.get(0).unwrap_or("").to_string(),
                         title: record.get(1).unwrap_or("").to_string(),
@@ -461,14 +479,20 @@ impl KvApp {
                         category: record.get(5).unwrap_or("").to_string(),
                         quantity: record.get(6).unwrap_or("").to_string(),
                     };
-                    
-                    if validate_book(&book).is_ok() && !self.db.books.iter().any(|b| b.isbn == book.isbn) {
+
+                    if validate_book(&book).is_ok()
+                        && !self.db.book_index.contains_key(&book.isbn)
+                    {
+                        self.db
+                            .book_index
+                            .insert(book.isbn.clone(), self.db.books.len());
                         self.db.books.push(book.clone());
-                        let _ = self.db.append_aof(Command::AddBook(book));
+                        aof_batch.push(Command::AddBook(book));
                         count += 1;
                     }
                 }
-                
+                let _ = self.db.append_aof_batch(&aof_batch);
+
                 let _ = self.db.save(&self.db_path);
                 self.db.rebuild_indexes();
                 self.book_filtered_indices.clear();

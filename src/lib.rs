@@ -313,12 +313,27 @@ impl Database {
         }
     }
 
-    // ✅ 追加命令到AOF日志
+    // ✅ 追加命令到AOF日志（单条，即时刷盘——用于交互式增删改）
     pub fn append_aof(&mut self, cmd: Command) -> Result<(), String> {
         if let Some(file) = &mut self.aof_file {
             let mut line = serde_json::to_string(&cmd).map_err(|e| e.to_string())?;
             line.push('\n');
             file.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+            file.flush().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// ✅ 批量追加 AOF（不逐条刷盘，最后统一 flush——用于 CSV 导入等批量操作）
+    pub fn append_aof_batch(&mut self, cmds: &[Command]) -> Result<(), String> {
+        if let Some(file) = &mut self.aof_file {
+            let mut buf = String::with_capacity(cmds.len() * 128);
+            for cmd in cmds {
+                let line = serde_json::to_string(cmd).map_err(|e| e.to_string())?;
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+            file.write_all(buf.as_bytes()).map_err(|e| e.to_string())?;
             file.flush().map_err(|e| e.to_string())?;
         }
         Ok(())
