@@ -4,8 +4,8 @@ use eframe::egui;
 use egui::{Align2, Color32, FontId, Rect, RichText, Stroke, Vec2};
 
 use kvstore::{
-    student_avg_grade, validate_book, validate_student, validate_teacher, Book, Command, Database,
-    Grade, Student, Teacher,
+    export_low_stock_report, export_student_report, student_avg_grade, validate_book,
+    validate_student, validate_teacher, Book, Command, Database, Grade, Student, Teacher,
 };
 
 // 颜色 
@@ -24,6 +24,9 @@ const SUCCESS: Color32 = Color32::from_rgb(46, 160, 67);
 const DANGER: Color32 = Color32::from_rgb(220, 53, 69);
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(30, 35, 50);
 const TEXT_HINT: Color32 = Color32::from_rgb(140, 150, 170);
+const WARNING: Color32 = Color32::from_rgb(255, 152, 0);
+const WARNING_BG: Color32 = Color32::from_rgb(255, 243, 224);
+const PAGE_SIZE: usize = 50; // ✅ 分页：每页50条，支持大规模数据
 
 //  标签页 & 排序 
 
@@ -58,16 +61,24 @@ pub struct KvApp {
     grade_score: String,
     student_selected: HashSet<usize>,
     student_sort: StudentSort,
+    student_page: usize, // ✅ 分页：学生当前页
+    student_filtered_indices: Vec<usize>, // ✅ 缓存过滤结果索引（避免每帧全量克隆）
+    student_filter_query: String, // ✅ 记录上次搜索词，用于判断缓存是否失效
 
     teacher_form: Teacher,
     teacher_edit_idx: Option<usize>,
     teacher_search: String,
     teacher_selected: HashSet<usize>,
+    teacher_page: usize, // ✅ 分页：教师当前页
+    teacher_filtered_indices: Vec<usize>,
 
     book_form: Book,
     book_edit_idx: Option<usize>,
     book_search: String,
     book_selected: HashSet<usize>,
+    low_stock_threshold: u32, // ✅ 图书低库存预警阈值
+    book_page: usize, // ✅ 分页：书籍当前页
+    book_filtered_indices: Vec<usize>,
 
     status_msg: String,
     status_ok: bool,
@@ -95,14 +106,22 @@ impl KvApp {
             grade_score: String::new(),
             student_selected: HashSet::new(),
             student_sort: StudentSort::Default,
+            student_page: 0,
+            student_filtered_indices: Vec::new(),
+            student_filter_query: String::new(),
             teacher_form: Teacher::default(),
             teacher_edit_idx: None,
             teacher_search: String::new(),
             teacher_selected: HashSet::new(),
+            teacher_page: 0,
+            teacher_filtered_indices: Vec::new(),
             book_form: Book::default(),
             book_edit_idx: None,
             book_search: String::new(),
             book_selected: HashSet::new(),
+            low_stock_threshold: 3, // ✅ 默认预警阈值：库存 ≤ 3 本
+            book_page: 0,
+            book_filtered_indices: Vec::new(),
             status_msg: "✅ 系统启动成功，数据已加载".into(),
             status_ok: true,
         }
@@ -176,15 +195,33 @@ impl KvApp {
                 ui.separator();
                 ui.add_space(12.0);
 
+                // ✅ 计算低库存书籍数量用于侧边栏警告
+                let low_stock_count = self
+                    .db
+                    .books
+                    .iter()
+                    .filter(|b| {
+                        b.quantity
+                            .parse::<u32>()
+                            .map(|q| q <= self.low_stock_threshold)
+                            .unwrap_or(false)
+                    })
+                    .count();
+
                 let tabs = [
-                    (Tab::Students, "👤", "学生管理", self.db.students.len()),
-                    (Tab::Teachers, "👨‍🏫", "教师管理", self.db.teachers.len()),
-                    (Tab::Books, "📖", "书籍管理", self.db.books.len()),
-                    (Tab::Stats, "📊", "数据统计", 0),
+                    (Tab::Students, "👤", "学生管理", self.db.students.len(), 0),
+                    (Tab::Teachers, "👨‍🏫", "教师管理", self.db.teachers.len(), 0),
+                    (Tab::Books, "📖", "书籍管理", self.db.books.len(), low_stock_count),
+                    (Tab::Stats, "📊", "数据统计", 0, 0),
                 ];
-                for (tab, icon, label, count) in tabs {
+                for (tab, icon, label, count, warn_count) in tabs {
                     let active = self.active_tab == tab;
-                    let text = if count > 0 {
+                    let text = if warn_count > 0 {
+                        format!(
+                            "{}  {} ({}) ⚠️{}",
+                            icon, label, count, warn_count
+                        )
+                    } else if count > 0 {
                         format!("{}  {} ({})", icon, label, count)
                     } else {
                         format!("{}  {}", icon, label)
@@ -198,10 +235,32 @@ impl KvApp {
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                     ui.add_space(12.0);
-                    ui.label(RichText::new("v1.2.0").size(11.0).color(SIDEBAR_TEXT));
+                    ui.label(RichText::new("v2.0.0").size(11.0).color(SIDEBAR_TEXT));
                     ui.add_space(10.0);
                     ui.separator();
                     ui.add_space(8.0);
+
+                    // ✅ 清空全部数据
+                    if ui.add(
+                        egui::Button::new(RichText::new("🗑️ 清空全部数据").size(12.5).color(DANGER))
+                            .fill(SIDEBAR_HOVER)
+                            .rounding(6.0)
+                            .min_size(Vec2::new(170.0, 32.0)),
+                    ).clicked() {
+                        self.db = Database::open(&self.db_path, &self.aof_path);
+                        // 清空并重建
+                        self.db.students.clear();
+                        self.db.teachers.clear();
+                        self.db.books.clear();
+                        self.db.rebuild_indexes();
+                        // 清空 AOF 文件
+                        let _ = std::fs::write(&self.aof_path, "");
+                        let _ = self.db.save(&self.db_path);
+                        self.clear_all_forms();
+                        self.status_msg = "✅ 已清空全部数据".into();
+                        self.status_ok = true;
+                    }
+                    ui.add_space(4.0);
 
                     if ui.add(sidebar_action_btn("📤 导出全部数据")).clicked() {
                         if let Some(path) = rfd::FileDialog::new()
@@ -236,6 +295,8 @@ impl KvApp {
                                             match serde_json::from_str::<Database>(&content) {
                                                 Ok(imported) => {
                                                     self.db = imported;
+                                                    self.db.rebuild_indexes();
+                                                    self.clear_all_forms();
                                                     let _ = self.db.save(&self.db_path);
                                                     self.status_msg = "✅ JSON数据导入成功".into();
                                                     self.status_ok = true;
@@ -348,6 +409,9 @@ impl KvApp {
                 }
                 
                 let _ = self.db.save(&self.db_path);
+                self.db.rebuild_indexes();
+                self.student_filtered_indices.clear();
+                self.student_filter_query.clear();
                 Ok((count, 0, 0))
             } else if has_teacher_headers {
                 // 教师CSV导入（不变）
@@ -376,6 +440,8 @@ impl KvApp {
                 }
                 
                 let _ = self.db.save(&self.db_path);
+                self.db.rebuild_indexes();
+                self.teacher_filtered_indices.clear();
                 Ok((0, count, 0))
             } else if has_book_headers {
                 // 书籍CSV导入（不变）
@@ -404,6 +470,8 @@ impl KvApp {
                 }
                 
                 let _ = self.db.save(&self.db_path);
+                self.db.rebuild_indexes();
+                self.book_filtered_indices.clear();
                 Ok((0, 0, count))
             } else {
                 Err("无法识别CSV格式，请确保包含正确的表头".into())
@@ -417,12 +485,19 @@ impl KvApp {
         self.grade_score.clear();
         self.student_selected.clear();
         self.student_sort = StudentSort::Default;
+        self.student_page = 0;
+        self.student_filtered_indices.clear();
+        self.student_filter_query.clear();
         self.teacher_form = Teacher::default();
         self.teacher_edit_idx = None;
         self.teacher_selected.clear();
+        self.teacher_page = 0;
+        self.teacher_filtered_indices.clear();
         self.book_form = Book::default();
         self.book_edit_idx = None;
         self.book_selected.clear();
+        self.book_page = 0;
+        self.book_filtered_indices.clear();
     }
 }
 
@@ -609,9 +684,8 @@ impl KvApp {
                     } else if !is_edit
                         && self
                             .db
-                            .students
-                            .iter()
-                            .any(|s| s.id == self.student_form.id)
+                            .student_index
+                            .contains_key(&self.student_form.id)
                     {
                         self.status_msg = "❌ 该学号已存在，请检查".into();
                         self.status_ok = false;
@@ -626,6 +700,10 @@ impl KvApp {
                             let _ = self.db.append_aof(Command::AddStudent(self.student_form.clone()));
                             self.status_msg = format!("✅ 已添加: {}", name);
                         }
+                        // ✅ 保存后重建索引并清空过滤缓存
+                        self.db.rebuild_indexes();
+                        self.student_filtered_indices.clear();
+                        self.student_filter_query.clear();
                         let _ = self.db.save(&self.db_path);
                         self.status_ok = true;
                         self.student_form = Student::default();
@@ -680,45 +758,73 @@ impl KvApp {
             }
         });
 
-        // 过滤
+        // ✅ 大规模优化：只在搜索词变化或数据增减时重建过滤索引（避免每帧克隆全量数据）
         let query = self.student_search.to_lowercase();
-        let mut filtered: Vec<(usize, Student)> = self
-            .db
-            .students
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| {
-                query.is_empty()
-                    || s.id.to_lowercase().contains(&query)
-                    || s.name.to_lowercase().contains(&query)
-                    || s.department.to_lowercase().contains(&query)
-                    || s.major.to_lowercase().contains(&query)
-                    || s.class_name.to_lowercase().contains(&query)
-            })
-            .map(|(i, s)| (i, s.clone()))
-            .collect();
+        if self.student_filter_query != query
+            || self.student_filtered_indices.is_empty()
+            || self.student_filtered_indices.len() != self.db.students.len()
+        {
+            // 重建过滤索引
+            self.student_filtered_indices.clear();
+            if query.is_empty() {
+                self.student_filtered_indices = (0..self.db.students.len()).collect();
+            } else {
+                self.student_filtered_indices = self
+                    .db
+                    .students
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| {
+                        s.id.to_lowercase().contains(&query)
+                            || s.name.to_lowercase().contains(&query)
+                            || s.department.to_lowercase().contains(&query)
+                            || s.major.to_lowercase().contains(&query)
+                            || s.class_name.to_lowercase().contains(&query)
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+            }
+            self.student_filter_query = query;
+            self.student_page = 0; // 搜索条件变，重置到第一页
+        }
 
-        // 排序
+        // 排序索引（只在需要时排序）
+        let mut sorted_indices = self.student_filtered_indices.clone();
         match self.student_sort {
             StudentSort::Default => {}
             StudentSort::ByAvgGrade => {
-                filtered.sort_by(|a, b| {
-                    let avg_a = student_avg_grade(&a.1).unwrap_or(-1.0);
-                    let avg_b = student_avg_grade(&b.1).unwrap_or(-1.0);
+                sorted_indices.sort_by(|a, b| {
+                    let avg_a = student_avg_grade(&self.db.students[*a]).unwrap_or(-1.0);
+                    let avg_b = student_avg_grade(&self.db.students[*b]).unwrap_or(-1.0);
                     avg_b
                         .partial_cmp(&avg_a)
                         .unwrap()
-                        .then(a.1.name.cmp(&b.1.name))
+                        .then(self.db.students[*a].name.cmp(&self.db.students[*b].name))
                 });
             }
             StudentSort::ByClass => {
-                filtered.sort_by(|a, b| {
-                    a.1.class_name
-                        .cmp(&b.1.class_name)
-                        .then(a.1.name.cmp(&b.1.name))
+                sorted_indices.sort_by(|a, b| {
+                    self.db.students[*a]
+                        .class_name
+                        .cmp(&self.db.students[*b].class_name)
+                        .then(self.db.students[*a].name.cmp(&self.db.students[*b].name))
                 });
             }
         }
+
+        // ✅ 分页
+        let total_filtered = sorted_indices.len();
+        let total_pages = if total_filtered == 0 {
+            0
+        } else {
+            (total_filtered + PAGE_SIZE - 1) / PAGE_SIZE
+        };
+        if self.student_page >= total_pages && total_pages > 0 {
+            self.student_page = total_pages - 1;
+        }
+        let page_start = self.student_page * PAGE_SIZE;
+        let page_end = ((self.student_page + 1) * PAGE_SIZE).min(total_filtered);
+        let page_indices: Vec<usize> = sorted_indices[page_start..page_end].to_vec();
 
         // 收集选中快照（避免借用冲突）
         let selected_snap: HashSet<usize> = self.student_selected.iter().copied().collect();
@@ -726,31 +832,34 @@ impl KvApp {
         let mut batch_delete_flag = false;
         let mut edit_idx: Option<usize> = None;
         let mut del_idx: Option<usize> = None;
+        let mut export_idx: Option<usize> = None;
 
         ui.add_space(8.0);
 
         card().show(ui, |ui| {
             ui.label(
                 RichText::new(format!(
-                    "📋 数据列表 (显示 {} / {} 条)",
-                    filtered.len(),
-                    self.db.students.len()
+                    "📋 数据列表 (显示 {}/{} 条，第 {} / {} 页)",
+                    page_indices.len(),
+                    total_filtered,
+                    self.student_page + 1,
+                    if total_pages == 0 { 1 } else { total_pages }
                 ))
                 .size(14.0)
                 .strong(),
             );
             ui.add_space(8.0);
 
-            // 批量操作栏
+            // 批量操作栏 + 分页控制
             ui.horizontal(|ui| {
                 if ui.button("☑ 全选").clicked() {
-                    for (idx, _) in &filtered {
+                    for idx in &sorted_indices {
                         checkbox_changes.push((*idx, true));
                     }
                 }
                 if !selected_snap.is_empty() {
                     if ui.button("☐ 取消全选").clicked() {
-                        for (idx, _) in &filtered {
+                        for idx in &sorted_indices {
                             checkbox_changes.push((*idx, false));
                         }
                     }
@@ -764,10 +873,30 @@ impl KvApp {
                         batch_delete_flag = true;
                     }
                 }
+                ui.separator();
+                // 分页按钮
+                if ui
+                    .add_enabled(self.student_page > 0, egui::Button::new("◀ 上一页"))
+                    .clicked()
+                    && self.student_page > 0
+                {
+                    self.student_page -= 1;
+                }
+                ui.label(format!("{}/{}", self.student_page + 1, if total_pages == 0 { 1 } else { total_pages }));
+                if ui
+                    .add_enabled(
+                        self.student_page + 1 < total_pages,
+                        egui::Button::new("下一页 ▶"),
+                    )
+                    .clicked()
+                    && self.student_page + 1 < total_pages
+                {
+                    self.student_page += 1;
+                }
             });
             ui.add_space(6.0);
 
-            if filtered.is_empty() {
+            if page_indices.is_empty() {
                 ui.vertical_centered(|ui| {
                     ui.add_space(20.0);
                     ui.label(RichText::new("暂无数据").color(TEXT_HINT));
@@ -778,13 +907,14 @@ impl KvApp {
                     batch_delete_flag,
                     edit_idx,
                     del_idx,
+                    export_idx,
                 );
                 return;
             }
 
             egui::ScrollArea::horizontal().show(ui, |ui| {
                 egui::Grid::new("student_table")
-                    .num_columns(10)
+                    .num_columns(11) // ✅ 增加一列：导出成绩单
                     .spacing([14.0, 8.0])
                     .striped(true)
                     .show(ui, |ui| {
@@ -798,12 +928,14 @@ impl KvApp {
                             "专业",
                             "班级",
                             "平均分",
+                            "成绩单",
                             "操作",
                         ] {
                             ui.label(RichText::new(*h).strong().color(ACCENT));
                         }
                         ui.end_row();
-                        for (i, s) in &filtered {
+                        for i in &page_indices {
+                            let s = &self.db.students[*i];
                             let mut sel = selected_snap.contains(i);
                             ui.checkbox(&mut sel, "");
                             if sel != selected_snap.contains(i) {
@@ -820,6 +952,10 @@ impl KvApp {
                                 Some(a) => format!("{:.1}", a),
                                 None => "—".into(),
                             });
+                            // ✅ 成绩单导出按钮
+                            if ui.small_button("📄").on_hover_text("导出成绩单").clicked() {
+                                export_idx = Some(*i);
+                            }
                             ui.horizontal(|ui| {
                                 if ui.small_button("✏").clicked() {
                                     edit_idx = Some(*i);
@@ -840,6 +976,7 @@ impl KvApp {
             batch_delete_flag,
             edit_idx,
             del_idx,
+            export_idx,
         );
     }
 }
@@ -850,6 +987,7 @@ fn apply_student_actions(
     batch_delete: bool,
     edit_idx: Option<usize>,
     del_idx: Option<usize>,
+    export_idx: Option<usize>,
 ) {
     for &(idx, selected) in checkbox_changes {
         if selected {
@@ -869,8 +1007,39 @@ fn apply_student_actions(
             }
         }
         let _ = app.db.save(&app.db_path);
+        // 删除后重建索引和过滤缓存
+        app.db.rebuild_indexes();
+        app.student_filtered_indices.clear();
+        app.student_filter_query.clear();
         app.status_msg = format!("✅ 已批量删除 {} 条学生记录", count);
         app.status_ok = true;
+        return;
+    }
+    if let Some(i) = export_idx {
+        if i < app.db.students.len() {
+            let student = &app.db.students[i];
+            let default_filename = format!("成绩单_{}_{}.csv", student.name, student.id);
+            if let Some(path) = rfd::FileDialog::new()
+                .set_file_name(&default_filename)
+                .add_filter("CSV", &["csv"])
+                .save_file()
+            {
+                let report = export_student_report(student);
+                match std::fs::write(&path, &report) {
+                    Ok(()) => {
+                        app.status_msg = format!(
+                            "✅ 成绩单已导出: {} ({})",
+                            student.name, student.id
+                        );
+                        app.status_ok = true;
+                    }
+                    Err(e) => {
+                        app.status_msg = format!("❌ 导出失败: {}", e);
+                        app.status_ok = false;
+                    }
+                }
+            }
+        }
         return;
     }
     if let Some(i) = edit_idx {
@@ -897,6 +1066,10 @@ fn apply_student_actions(
                     app.student_selected.insert(idx);
                 }
             }
+            // ✅ 删除后重建索引和过滤缓存
+            app.db.rebuild_indexes();
+            app.student_filtered_indices.clear();
+            app.student_filter_query.clear();
             let _ = app.db.save(&app.db_path);
             app.status_msg = format!("✅ 已删除: {}", name);
             app.status_ok = true;
@@ -1031,9 +1204,8 @@ impl KvApp {
                     } else if !is_edit
                         && self
                             .db
-                            .teachers
-                            .iter()
-                            .any(|t| t.id == self.teacher_form.id)
+                            .teacher_index
+                            .contains_key(&self.teacher_form.id)
                     {
                         self.status_msg = "❌ 该工号已存在".into();
                         self.status_ok = false;
@@ -1048,6 +1220,9 @@ impl KvApp {
                             let _ = self.db.append_aof(Command::AddTeacher(self.teacher_form.clone()));
                             self.status_msg = format!("✅ 已添加: {}", name);
                         }
+                        // ✅ 保存后重建索引并清空过滤缓存
+                        self.db.rebuild_indexes();
+                        self.teacher_filtered_indices.clear();
                         let _ = self.db.save(&self.db_path);
                         self.status_ok = true;
                         self.teacher_form = Teacher::default();
@@ -1081,20 +1256,40 @@ impl KvApp {
         });
 
         let query = self.teacher_search.to_lowercase();
-        let filtered: Vec<(usize, Teacher)> = self
-            .db
-            .teachers
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| {
-                query.is_empty()
-                    || t.id.to_lowercase().contains(&query)
-                    || t.name.to_lowercase().contains(&query)
-                    || t.department.to_lowercase().contains(&query)
-                    || t.title.to_lowercase().contains(&query)
-            })
-            .map(|(i, t)| (i, t.clone()))
-            .collect();
+        // ✅ 大规模优化：缓存过滤索引
+        self.teacher_filtered_indices.clear();
+        if query.is_empty() {
+            self.teacher_filtered_indices = (0..self.db.teachers.len()).collect();
+        } else {
+            self.teacher_filtered_indices = self
+                .db
+                .teachers
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| {
+                    t.id.to_lowercase().contains(&query)
+                        || t.name.to_lowercase().contains(&query)
+                        || t.department.to_lowercase().contains(&query)
+                        || t.title.to_lowercase().contains(&query)
+                })
+                .map(|(i, _)| i)
+                .collect();
+        }
+
+        // ✅ 分页
+        let total_filtered = self.teacher_filtered_indices.len();
+        let total_pages = if total_filtered == 0 {
+            0
+        } else {
+            (total_filtered + PAGE_SIZE - 1) / PAGE_SIZE
+        };
+        if self.teacher_page >= total_pages && total_pages > 0 {
+            self.teacher_page = total_pages - 1;
+        }
+        let page_start = self.teacher_page * PAGE_SIZE;
+        let page_end = ((self.teacher_page + 1) * PAGE_SIZE).min(total_filtered);
+        let page_indices: Vec<usize> =
+            self.teacher_filtered_indices[page_start..page_end].to_vec();
 
         let selected_snap: HashSet<usize> = self.teacher_selected.iter().copied().collect();
         let mut checkbox_changes: Vec<(usize, bool)> = Vec::new();
@@ -1107,9 +1302,11 @@ impl KvApp {
         card().show(ui, |ui| {
             ui.label(
                 RichText::new(format!(
-                    "📋 数据列表 (显示 {} / {} 条)",
-                    filtered.len(),
-                    self.db.teachers.len()
+                    "📋 数据列表 (显示 {}/{} 条，第 {} / {} 页)",
+                    page_indices.len(),
+                    total_filtered,
+                    self.teacher_page + 1,
+                    if total_pages == 0 { 1 } else { total_pages }
                 ))
                 .size(14.0)
                 .strong(),
@@ -1117,13 +1314,13 @@ impl KvApp {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button("☑ 全选").clicked() {
-                    for (idx, _) in &filtered {
+                    for idx in &self.teacher_filtered_indices {
                         checkbox_changes.push((*idx, true));
                     }
                 }
                 if !selected_snap.is_empty() {
                     if ui.button("☐ 取消全选").clicked() {
-                        for (idx, _) in &filtered {
+                        for idx in &self.teacher_filtered_indices {
                             checkbox_changes.push((*idx, false));
                         }
                     }
@@ -1137,9 +1334,29 @@ impl KvApp {
                         batch_delete_flag = true;
                     }
                 }
+                ui.separator();
+                // 分页按钮
+                if ui
+                    .add_enabled(self.teacher_page > 0, egui::Button::new("◀ 上一页"))
+                    .clicked()
+                    && self.teacher_page > 0
+                {
+                    self.teacher_page -= 1;
+                }
+                ui.label(format!("{}/{}", self.teacher_page + 1, if total_pages == 0 { 1 } else { total_pages }));
+                if ui
+                    .add_enabled(
+                        self.teacher_page + 1 < total_pages,
+                        egui::Button::new("下一页 ▶"),
+                    )
+                    .clicked()
+                    && self.teacher_page + 1 < total_pages
+                {
+                    self.teacher_page += 1;
+                }
             });
             ui.add_space(6.0);
-            if filtered.is_empty() {
+            if page_indices.is_empty() {
                 ui.vertical_centered(|ui| {
                     ui.add_space(20.0);
                     ui.label(RichText::new("暂无数据").color(TEXT_HINT));
@@ -1173,7 +1390,8 @@ impl KvApp {
                             ui.label(RichText::new(*h).strong().color(ACCENT));
                         }
                         ui.end_row();
-                        for (i, t) in &filtered {
+                        for i in &page_indices {
+                            let t = &self.db.teachers[*i];
                             let mut sel = selected_snap.contains(i);
                             ui.checkbox(&mut sel, "");
                             if sel != selected_snap.contains(i) {
@@ -1234,6 +1452,8 @@ fn apply_teacher_actions(
             }
         }
         let _ = app.db.save(&app.db_path);
+        app.db.rebuild_indexes();
+        app.teacher_filtered_indices.clear();
         app.status_msg = format!("✅ 已批量删除 {} 条教师记录", count);
         app.status_ok = true;
         return;
@@ -1260,6 +1480,8 @@ fn apply_teacher_actions(
                     app.teacher_selected.insert(idx);
                 }
             }
+            app.db.rebuild_indexes();
+            app.teacher_filtered_indices.clear();
             let _ = app.db.save(&app.db_path);
             app.status_msg = format!("✅ 已删除: {}", name);
             app.status_ok = true;
@@ -1374,7 +1596,7 @@ impl KvApp {
                         self.status_msg = format!("❌ {}", e);
                         self.status_ok = false;
                     } else if !is_edit
-                        && self.db.books.iter().any(|b| b.isbn == self.book_form.isbn)
+                        && self.db.book_index.contains_key(&self.book_form.isbn)
                     {
                         self.status_msg = "❌ 该 ISBN 已存在".into();
                         self.status_ok = false;
@@ -1389,6 +1611,9 @@ impl KvApp {
                             let _ = self.db.append_aof(Command::AddBook(self.book_form.clone()));
                             self.status_msg = format!("✅ 已添加: {}", title);
                         }
+                        // ✅ 保存后重建索引并清空过滤缓存
+                        self.db.rebuild_indexes();
+                        self.book_filtered_indices.clear();
                         let _ = self.db.save(&self.db_path);
                         self.status_ok = true;
                         self.book_form = Book::default();
@@ -1414,29 +1639,62 @@ impl KvApp {
             ui.add(
                 egui::TextEdit::singleline(&mut self.book_search)
                     .hint_text("输入 ISBN、书名、作者、出版社、分类等关键词搜索…")
-                    .desired_width(360.0),
+                    .desired_width(280.0),
             );
             if ui.button("清空").clicked() {
                 self.book_search.clear();
             }
+            ui.separator();
+            // ✅ 低库存预警阈值设置
+            ui.label("⚠️ 预警阈值:");
+            ui.add(
+                egui::DragValue::new(&mut self.low_stock_threshold)
+                    .range(0..=100)
+                    .speed(1)
+                    .prefix("≤ "),
+            );
+            ui.label("本");
+            if ui.small_button("重置").clicked() {
+                self.low_stock_threshold = 3;
+            }
         });
 
         let query = self.book_search.to_lowercase();
-        let filtered: Vec<(usize, Book)> = self
-            .db
-            .books
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| {
-                query.is_empty()
-                    || b.isbn.to_lowercase().contains(&query)
-                    || b.title.to_lowercase().contains(&query)
-                    || b.author.to_lowercase().contains(&query)
-                    || b.publisher.to_lowercase().contains(&query)
-                    || b.category.to_lowercase().contains(&query)
-            })
-            .map(|(i, b)| (i, b.clone()))
-            .collect();
+        // ✅ 大规模优化：缓存过滤索引
+        self.book_filtered_indices.clear();
+        if query.is_empty() {
+            self.book_filtered_indices = (0..self.db.books.len()).collect();
+        } else {
+            self.book_filtered_indices = self
+                .db
+                .books
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| {
+                    b.isbn.to_lowercase().contains(&query)
+                        || b.title.to_lowercase().contains(&query)
+                        || b.author.to_lowercase().contains(&query)
+                        || b.publisher.to_lowercase().contains(&query)
+                        || b.category.to_lowercase().contains(&query)
+                })
+                .map(|(i, _)| i)
+                .collect();
+        }
+
+        // ✅ 分页
+        let total_filtered = self.book_filtered_indices.len();
+        let total_pages = if total_filtered == 0 {
+            0
+        } else {
+            (total_filtered + PAGE_SIZE - 1) / PAGE_SIZE
+        };
+        if self.book_page >= total_pages && total_pages > 0 {
+            self.book_page = total_pages - 1;
+        }
+        let page_start = self.book_page * PAGE_SIZE;
+        let page_end = ((self.book_page + 1) * PAGE_SIZE).min(total_filtered);
+        let page_indices: Vec<usize> =
+            self.book_filtered_indices[page_start..page_end].to_vec();
 
         let selected_snap: HashSet<usize> = self.book_selected.iter().copied().collect();
         let mut checkbox_changes: Vec<(usize, bool)> = Vec::new();
@@ -1444,13 +1702,39 @@ impl KvApp {
         let mut edit_idx: Option<usize> = None;
         let mut del_idx: Option<usize> = None;
 
+        // ✅ 低库存警告提示
+        let low_stock_count = self
+            .db
+            .books
+            .iter()
+            .filter(|b| {
+                b.quantity
+                    .parse::<u32>()
+                    .map(|q| q <= self.low_stock_threshold)
+                    .unwrap_or(false)
+            })
+            .count();
+        if low_stock_count > 0 {
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!(
+                    "⚠️ 警告: {} 种书籍库存 ≤ {} 本，急需补充！",
+                    low_stock_count, self.low_stock_threshold
+                ))
+                .color(WARNING)
+                .size(13.0),
+            );
+        }
+
         ui.add_space(8.0);
         card().show(ui, |ui| {
             ui.label(
                 RichText::new(format!(
-                    "📋 数据列表 (显示 {} / {} 条)",
-                    filtered.len(),
-                    self.db.books.len()
+                    "📋 数据列表 (显示 {}/{} 条，第 {} / {} 页)",
+                    page_indices.len(),
+                    total_filtered,
+                    self.book_page + 1,
+                    if total_pages == 0 { 1 } else { total_pages }
                 ))
                 .size(14.0)
                 .strong(),
@@ -1458,13 +1742,13 @@ impl KvApp {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button("☑ 全选").clicked() {
-                    for (idx, _) in &filtered {
+                    for idx in &self.book_filtered_indices {
                         checkbox_changes.push((*idx, true));
                     }
                 }
                 if !selected_snap.is_empty() {
                     if ui.button("☐ 取消全选").clicked() {
-                        for (idx, _) in &filtered {
+                        for idx in &self.book_filtered_indices {
                             checkbox_changes.push((*idx, false));
                         }
                     }
@@ -1478,9 +1762,29 @@ impl KvApp {
                         batch_delete_flag = true;
                     }
                 }
+                ui.separator();
+                // 分页按钮
+                if ui
+                    .add_enabled(self.book_page > 0, egui::Button::new("◀ 上一页"))
+                    .clicked()
+                    && self.book_page > 0
+                {
+                    self.book_page -= 1;
+                }
+                ui.label(format!("{}/{}", self.book_page + 1, if total_pages == 0 { 1 } else { total_pages }));
+                if ui
+                    .add_enabled(
+                        self.book_page + 1 < total_pages,
+                        egui::Button::new("下一页 ▶"),
+                    )
+                    .clicked()
+                    && self.book_page + 1 < total_pages
+                {
+                    self.book_page += 1;
+                }
             });
             ui.add_space(6.0);
-            if filtered.is_empty() {
+            if page_indices.is_empty() {
                 ui.vertical_centered(|ui| {
                     ui.add_space(20.0);
                     ui.label(RichText::new("暂无数据").color(TEXT_HINT));
@@ -1496,7 +1800,7 @@ impl KvApp {
             }
             egui::ScrollArea::horizontal().show(ui, |ui| {
                 egui::Grid::new("book_table")
-                    .num_columns(9)
+                    .num_columns(10) // ✅ 增加一列：预警
                     .spacing([14.0, 8.0])
                     .striped(true)
                     .show(ui, |ui| {
@@ -1509,12 +1813,14 @@ impl KvApp {
                             "年份",
                             "分类",
                             "数量",
+                            "预警",
                             "操作",
                         ] {
                             ui.label(RichText::new(*h).strong().color(ACCENT));
                         }
                         ui.end_row();
-                        for (i, b) in &filtered {
+                        for i in &page_indices {
+                            let b = &self.db.books[*i];
                             let mut sel = selected_snap.contains(i);
                             ui.checkbox(&mut sel, "");
                             if sel != selected_snap.contains(i) {
@@ -1526,7 +1832,29 @@ impl KvApp {
                             ui.label(&b.publisher);
                             ui.label(&b.year);
                             ui.label(&b.category);
-                            ui.label(&b.quantity);
+                            // ✅ 低库存时用红色标注数量
+                            let qty_parsed = b.quantity.parse::<u32>().unwrap_or(0);
+                            if qty_parsed <= self.low_stock_threshold {
+                                ui.label(
+                                    RichText::new(&b.quantity)
+                                        .color(WARNING)
+                                        .strong(),
+                                );
+                            } else {
+                                ui.label(&b.quantity);
+                            }
+                            // ✅ 预警列
+                            if qty_parsed == 0 {
+                                ui.label(RichText::new("🔴 缺货").color(DANGER).size(11.0));
+                            } else if qty_parsed <= self.low_stock_threshold {
+                                ui.label(
+                                    RichText::new(format!("⚠️ 低库存({})", qty_parsed))
+                                        .color(WARNING)
+                                        .size(11.0),
+                                );
+                            } else {
+                                ui.label(RichText::new("✅").color(SUCCESS).size(11.0));
+                            }
                             ui.horizontal(|ui| {
                                 if ui.small_button("✏").clicked() {
                                     edit_idx = Some(*i);
@@ -1575,6 +1903,8 @@ fn apply_book_actions(
             }
         }
         let _ = app.db.save(&app.db_path);
+        app.db.rebuild_indexes();
+        app.book_filtered_indices.clear();
         app.status_msg = format!("✅ 已批量删除 {} 条书籍记录", count);
         app.status_ok = true;
         return;
@@ -1601,6 +1931,8 @@ fn apply_book_actions(
                     app.book_selected.insert(idx);
                 }
             }
+            app.db.rebuild_indexes();
+            app.book_filtered_indices.clear();
             let _ = app.db.save(&app.db_path);
             app.status_msg = format!("✅ 已删除: {}", title);
             app.status_ok = true;
@@ -1683,7 +2015,7 @@ impl KvApp {
 
         ui.add_space(16.0);
 
-        //  学生分布 
+        //  学生分布
         if !students.is_empty() {
             card().show(ui, |ui| {
                 ui.label(RichText::new("👤 学生分布").size(15.0).strong());
@@ -1691,7 +2023,13 @@ impl KvApp {
 
                 let male = students.iter().filter(|s| s.gender == "男").count();
                 let female = students.len() - male;
-                ui.label(format!("男女比例: {} 男 : {} 女", male, female));
+                let total_s = students.len() as f32;
+                ui.label(format!(
+                    "男女比例: {} 男 : {} 女  (男 {:.1}% / 女 {:.1}%)",
+                    male, female,
+                    male as f32 / total_s * 100.0,
+                    female as f32 / total_s * 100.0,
+                ));
 
                 let avg_age: f64 = students
                     .iter()
@@ -1725,6 +2063,53 @@ impl KvApp {
                     );
                     ui.add_space(4.0);
                 }
+
+                // ✅ 院系 × 性别交叉统计
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.label(RichText::new("院系性别交叉统计:").size(13.0).strong());
+                ui.add_space(4.0);
+
+                let mut dept_gender: HashMap<&str, (usize, usize)> = HashMap::new();
+                for s in students {
+                    let entry = dept_gender.entry(s.department.as_str()).or_insert((0, 0));
+                    if s.gender == "男" {
+                        entry.0 += 1;
+                    } else {
+                        entry.1 += 1;
+                    }
+                }
+
+                egui::Grid::new("dept_gender_grid")
+                    .num_columns(5)
+                    .spacing([14.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("院系").strong().color(ACCENT));
+                        ui.label(RichText::new("总人数").strong().color(ACCENT));
+                        ui.label(RichText::new("男").strong().color(Color32::from_rgb(55, 120, 220)));
+                        ui.label(RichText::new("女").strong().color(Color32::from_rgb(220, 80, 120)));
+                        ui.label(RichText::new("男女比").strong().color(ACCENT));
+                        ui.end_row();
+
+                        let mut dg_sorted: Vec<_> = dept_gender.into_iter().collect();
+                        dg_sorted.sort_by(|a, b| (b.1.0 + b.1.1).cmp(&(a.1.0 + a.1.1)));
+
+                        for (dept, (m, f)) in &dg_sorted {
+                            let total_d = m + f;
+                            let ratio = if *f > 0 {
+                                format!("{:.1}:1", *m as f32 / *f as f32)
+                            } else {
+                                "全男".into()
+                            };
+                            ui.label(*dept);
+                            ui.label(format!("{}", total_d));
+                            ui.label(format!("{}", m));
+                            ui.label(format!("{}", f));
+                            ui.label(RichText::new(ratio).size(11.0).color(TEXT_HINT));
+                            ui.end_row();
+                        }
+                    });
             });
             ui.add_space(12.0);
         }
@@ -1760,7 +2145,7 @@ impl KvApp {
             ui.add_space(12.0);
         }
 
-        //  书籍分布 
+        //  书籍分布
         if !books.is_empty() {
             card().show(ui, |ui| {
                 ui.label(RichText::new("📖 书籍分类分布").size(15.0).strong());
@@ -1788,6 +2173,78 @@ impl KvApp {
                     ui.add_space(4.0);
                 }
             });
+            ui.add_space(12.0);
+
+            // ✅ 低库存预警卡片
+            let low_stock: Vec<(&Book, u32)> = self.db.get_low_stock_books(self.low_stock_threshold);
+            if !low_stock.is_empty() {
+                card().show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "⚠️ 低库存预警 (阈值 ≤ {} 本，共 {} 种)",
+                            self.low_stock_threshold,
+                            low_stock.len()
+                        ))
+                        .size(15.0)
+                        .strong()
+                        .color(WARNING),
+                    );
+                    ui.add_space(8.0);
+
+                    egui::ScrollArea::horizontal().show(ui, |ui| {
+                        egui::Grid::new("low_stock_table")
+                            .num_columns(5)
+                            .spacing([14.0, 6.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for h in &["ISBN", "书名", "作者", "分类", "库存"] {
+                                    ui.label(RichText::new(*h).strong().color(ACCENT));
+                                }
+                                ui.end_row();
+                                for (book, qty) in &low_stock {
+                                    ui.label(&book.isbn);
+                                    ui.label(&book.title);
+                                    ui.label(&book.author);
+                                    ui.label(&book.category);
+                                    let color = if *qty == 0 {
+                                        DANGER
+                                    } else {
+                                        WARNING
+                                    };
+                                    ui.label(
+                                        RichText::new(format!("{} 本", qty)).color(color).strong(),
+                                    );
+                                    ui.end_row();
+                                }
+                            });
+                    });
+
+                    ui.add_space(8.0);
+                    // ✅ 导出低库存报告按钮
+                    if ui.button("📤 导出低库存报告").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_file_name("低库存预警报告.csv")
+                            .add_filter("CSV", &["csv"])
+                            .save_file()
+                        {
+                            let report = export_low_stock_report(&low_stock);
+                            match std::fs::write(&path, &report) {
+                                Ok(()) => {
+                                    self.status_msg = format!(
+                                        "✅ 低库存报告已导出: {} 种书籍",
+                                        low_stock.len()
+                                    );
+                                    self.status_ok = true;
+                                }
+                                Err(e) => {
+                                    self.status_msg = format!("❌ 导出失败: {}", e);
+                                    self.status_ok = false;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
         }
 
         if students.is_empty() && teachers.is_empty() && books.is_empty() {
