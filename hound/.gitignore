@@ -1,0 +1,46 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# IDE files
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Compiled output
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+
+# Test artifacts
+Testing/
+CTestTestfile.cmake
+Testing/Temporary/
+
+# Package files
+*.deb
+*.rpm
+*.tar.gz
+
+# Core dumps
+core
+core.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Static analysis
+compile_commands.json
+
+# Benchmark results
+benchmark_results/

@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  BUILD_TYPE: Debug
+
+jobs:
+  # ── Build + Test (Linux, GCC) ──────────────────────────────
+  linux-gcc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get install -y g++-13
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=$BUILD_TYPE
+                      -DCMAKE_CXX_COMPILER=g++-13
+                      -DHOUND_ENABLE_ASAN=ON
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure -j $(nproc)
+
+  # ── Build + Test (Linux, Clang) ────────────────────────────
+  linux-clang:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get install -y clang-17
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=$BUILD_TYPE
+                      -DCMAKE_CXX_COMPILER=clang++-17
+                      -DHOUND_ENABLE_UBSAN=ON
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure -j $(nproc)
+
+  # ── Build + Test (macOS) ───────────────────────────────────
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=$BUILD_TYPE
+
+      - name: Build
+        run: cmake --build build --parallel $(sysctl -n hw.logicalcpu)
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure -j $(sysctl -n hw.logicalcpu)
+
+  # ── Build (Windows, MSVC) ──────────────────────────────────
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=$env:BUILD_TYPE
+
+      - name: Build
+        run: cmake --build build --parallel $env:NUMBER_OF_PROCESSORS
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure -j $env:NUMBER_OF_PROCESSORS
